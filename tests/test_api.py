@@ -476,3 +476,475 @@ def test_daily_occupancy_reuses_schedule_validation():
         "/daily-occupancy", json={**OCCUPANCY_BASE, "duration_minutes": 0}
     )
     assert resp.status_code == 422
+
+
+# --- POST /staffing-gaps ----------------------------------------------------
+
+# 窗口：2026-03-02 全天（UTC）
+STAFF_WINDOW = {
+    "window_start_utc": "2026-03-02T00:00:00Z",
+    "window_end_utc": "2026-03-03T00:00:00Z",
+}
+# 柏林 2026-03-02（周一）09:00 CET = 08:00 UTC，60 分钟
+STAFF_SCHED_BERLIN = {
+    "timezone": "Europe/Berlin",
+    "start_date": "2026-03-02",
+    "end_date": "2026-03-02",
+    "weekdays": [0],
+    "local_time": "09:00",
+    "duration_minutes": 60,
+}
+# 纽约同日 03:30 EST = 08:30 UTC，60 分钟
+STAFF_SCHED_NY = {
+    "timezone": "America/New_York",
+    "start_date": "2026-03-02",
+    "end_date": "2026-03-02",
+    "weekdays": [0],
+    "local_time": "03:30",
+    "duration_minutes": 60,
+}
+
+
+def _staff_payload(**overrides):
+    payload = {
+        **STAFF_WINDOW,
+        "min_staff": 2,
+        "employees": [
+            {"id": "alice", "schedules": [STAFF_SCHED_BERLIN]},
+            {"id": "bob", "schedules": [STAFF_SCHED_NY]},
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _utc_schedule(local_time: str, duration: int = 60) -> dict:
+    return {
+        "timezone": "UTC",
+        "start_date": "2026-03-02",
+        "end_date": "2026-03-02",
+        "weekdays": [0],
+        "local_time": local_time,
+        "duration_minutes": duration,
+    }
+
+
+def test_staffing_gaps_basic():
+    resp = client.post("/staffing-gaps", json=_staff_payload())
+    assert resp.status_code == 200
+    body = resp.json()
+    # alice [08:00,09:00)，bob [08:30,09:30)；min_staff=2
+    assert body["count"] == 4
+    assert body["gaps"] == [
+        {
+            "start_utc": "2026-03-02T00:00:00Z",
+            "end_utc": "2026-03-02T08:00:00Z",
+            "on_duty": [],
+            "missing": 2,
+        },
+        {
+            "start_utc": "2026-03-02T08:00:00Z",
+            "end_utc": "2026-03-02T08:30:00Z",
+            "on_duty": ["alice"],
+            "missing": 1,
+        },
+        {
+            "start_utc": "2026-03-02T09:00:00Z",
+            "end_utc": "2026-03-02T09:30:00Z",
+            "on_duty": ["bob"],
+            "missing": 1,
+        },
+        {
+            "start_utc": "2026-03-02T09:30:00Z",
+            "end_utc": "2026-03-03T00:00:00Z",
+            "on_duty": [],
+            "missing": 2,
+        },
+    ]
+
+
+def test_staffing_gaps_fully_staffed_returns_empty():
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            min_staff=1,
+            employees=[
+                {"id": "alice", "schedules": [_utc_schedule("00:00", 1440)]}
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"count": 0, "gaps": []}
+
+
+def test_staffing_gaps_null_schedules_never_on_duty():
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            min_staff=1,
+            employees=[{"id": "alice", "schedules": None}, {"id": "bob"}],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "count": 1,
+        "gaps": [
+            {
+                "start_utc": "2026-03-02T00:00:00Z",
+                "end_utc": "2026-03-03T00:00:00Z",
+                "on_duty": [],
+                "missing": 1,
+            }
+        ],
+    }
+
+
+def test_staffing_gaps_clips_to_window():
+    # 实例 2026-03-01 23:00 UTC 起 120 分钟，仅 [00:00, 01:00) 落在窗口内
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            min_staff=1,
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [
+                        {
+                            "timezone": "UTC",
+                            "start_date": "2026-03-01",
+                            "end_date": "2026-03-01",
+                            "weekdays": [6],
+                            "local_time": "23:00",
+                            "duration_minutes": 120,
+                        }
+                    ],
+                }
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["gaps"] == [
+        {
+            "start_utc": "2026-03-02T01:00:00Z",
+            "end_utc": "2026-03-03T00:00:00Z",
+            "on_duty": [],
+            "missing": 1,
+        }
+    ]
+
+
+def test_staffing_gaps_same_employee_touching_intervals_count_once():
+    # alice 两段相接日程 08:00+60 / 09:00+60 -> 连续在岗 [08:00,10:00)，只计一人
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            min_staff=1,
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [
+                        _utc_schedule("08:00"),
+                        _utc_schedule("09:00"),
+                    ],
+                }
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["gaps"] == [
+        {
+            "start_utc": "2026-03-02T00:00:00Z",
+            "end_utc": "2026-03-02T08:00:00Z",
+            "on_duty": [],
+            "missing": 1,
+        },
+        {
+            "start_utc": "2026-03-02T10:00:00Z",
+            "end_utc": "2026-03-03T00:00:00Z",
+            "on_duty": [],
+            "missing": 1,
+        },
+    ]
+
+
+def test_staffing_gaps_same_instant_handoff_no_zero_gap():
+    # alice [08:00,09:00)，bob [09:00,10:00)：09:00 的上下岗一起处理
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            min_staff=1,
+            employees=[
+                {"id": "alice", "schedules": [_utc_schedule("08:00")]},
+                {"id": "bob", "schedules": [_utc_schedule("09:00")]},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["gaps"] == [
+        {
+            "start_utc": "2026-03-02T00:00:00Z",
+            "end_utc": "2026-03-02T08:00:00Z",
+            "on_duty": [],
+            "missing": 1,
+        },
+        {
+            "start_utc": "2026-03-02T10:00:00Z",
+            "end_utc": "2026-03-03T00:00:00Z",
+            "on_duty": [],
+            "missing": 1,
+        },
+    ]
+
+
+def test_staffing_gaps_on_duty_ids_sorted():
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            min_staff=3,
+            employees=[
+                {"id": "zoe", "schedules": [_utc_schedule("08:00", 120)]},
+                {"id": "amy", "schedules": [_utc_schedule("08:00", 120)]},
+                {"id": "bob", "schedules": None},
+            ],
+        ),
+    )
+    assert resp.status_code == 200
+    gaps = resp.json()["gaps"]
+    assert gaps[1] == {
+        "start_utc": "2026-03-02T08:00:00Z",
+        "end_utc": "2026-03-02T10:00:00Z",
+        "on_duty": ["amy", "zoe"],
+        "missing": 1,
+    }
+
+
+def test_staffing_gaps_reuses_fold_expansion():
+    # 纽约 2026-11-01 01:30 出现两次（05:30 / 06:30 UTC），各 60 分钟且相接
+    # -> 同一员工合并为连续在岗 [05:30, 07:30)，只计一人
+    resp = client.post(
+        "/staffing-gaps",
+        json={
+            "window_start_utc": "2026-11-01T00:00:00Z",
+            "window_end_utc": "2026-11-02T00:00:00Z",
+            "min_staff": 1,
+            "employees": [
+                {
+                    "id": "alice",
+                    "schedules": [
+                        {
+                            "timezone": "America/New_York",
+                            "start_date": "2026-11-01",
+                            "end_date": "2026-11-01",
+                            "weekdays": [6],
+                            "local_time": "01:30",
+                            "fold_strategy": "both",
+                            "duration_minutes": 60,
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["gaps"] == [
+        {
+            "start_utc": "2026-11-01T00:00:00Z",
+            "end_utc": "2026-11-01T05:30:00Z",
+            "on_duty": [],
+            "missing": 1,
+        },
+        {
+            "start_utc": "2026-11-01T07:30:00Z",
+            "end_utc": "2026-11-02T00:00:00Z",
+            "on_duty": [],
+            "missing": 1,
+        },
+    ]
+
+
+def test_staffing_gaps_reuses_gap_shift_forward():
+    # 纽约 2026-03-08 02:30 不存在；shift_forward 后 03:30 EDT = 07:30 UTC
+    resp = client.post(
+        "/staffing-gaps",
+        json={
+            "window_start_utc": "2026-03-08T00:00:00Z",
+            "window_end_utc": "2026-03-09T00:00:00Z",
+            "min_staff": 1,
+            "employees": [
+                {
+                    "id": "alice",
+                    "schedules": [
+                        {
+                            "timezone": "America/New_York",
+                            "start_date": "2026-03-08",
+                            "end_date": "2026-03-08",
+                            "weekdays": [6],
+                            "local_time": "02:30",
+                            "gap_strategy": "shift_forward",
+                            "duration_minutes": 60,
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["gaps"] == [
+        {
+            "start_utc": "2026-03-08T00:00:00Z",
+            "end_utc": "2026-03-08T07:30:00Z",
+            "on_duty": [],
+            "missing": 1,
+        },
+        {
+            "start_utc": "2026-03-08T08:30:00Z",
+            "end_utc": "2026-03-09T00:00:00Z",
+            "on_duty": [],
+            "missing": 1,
+        },
+    ]
+
+
+def test_staffing_gaps_window_must_be_z_utc_422():
+    # 缺少 Z 后缀 / 用 +00:00 代替 Z 均非法
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(window_start_utc="2026-03-02T00:00:00"),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(window_start_utc="2026-03-02T00:00:00+00:00"),
+    )
+    assert resp.status_code == 422
+
+
+def test_staffing_gaps_window_not_increasing_422():
+    # 相等与逆序都非法
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(window_end_utc="2026-03-02T00:00:00Z"),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            window_start_utc="2026-03-03T00:00:00Z",
+            window_end_utc="2026-03-02T00:00:00Z",
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_staffing_gaps_window_over_366_days_422():
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            window_start_utc="2026-01-01T00:00:00Z",
+            window_end_utc="2027-01-03T00:00:00Z",
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_staffing_gaps_window_exactly_366_days_ok():
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            window_start_utc="2026-01-01T00:00:00Z",
+            window_end_utc="2027-01-02T00:00:00Z",  # 恰好 366 天
+        ),
+    )
+    assert resp.status_code == 200
+
+
+def test_staffing_gaps_min_staff_bounds_422():
+    resp = client.post("/staffing-gaps", json=_staff_payload(min_staff=0))
+    assert resp.status_code == 422
+
+    # 超过员工总数（2 名员工）
+    resp = client.post("/staffing-gaps", json=_staff_payload(min_staff=3))
+    assert resp.status_code == 422
+
+
+def test_staffing_gaps_employee_count_bounds():
+    resp = client.post("/staffing-gaps", json=_staff_payload(employees=[]))
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            min_staff=1, employees=[{"id": f"e{i}"} for i in range(21)]
+        ),
+    )
+    assert resp.status_code == 422
+
+    # 20 名合法
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            min_staff=1, employees=[{"id": f"e{i}"} for i in range(20)]
+        ),
+    )
+    assert resp.status_code == 200
+
+
+def test_staffing_gaps_duplicate_employee_ids_422():
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(employees=[{"id": "alice"}, {"id": "alice"}]),
+    )
+    assert resp.status_code == 422
+
+
+def test_staffing_gaps_reuses_schedule_validation():
+    # 日程沿用 /overlaps 单侧校验：非法时区 / 时长越界 / 区间超 366 天均 422
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [{**STAFF_SCHED_BERLIN, "timezone": "Not/AZone"}],
+                },
+                {"id": "bob"},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [{**STAFF_SCHED_BERLIN, "duration_minutes": 0}],
+                },
+                {"id": "bob"},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/staffing-gaps",
+        json=_staff_payload(
+            employees=[
+                {
+                    "id": "alice",
+                    "schedules": [
+                        {
+                            **STAFF_SCHED_BERLIN,
+                            "start_date": "2026-01-01",
+                            "end_date": "2027-01-03",
+                        }
+                    ],
+                },
+                {"id": "bob"},
+            ]
+        ),
+    )
+    assert resp.status_code == 422

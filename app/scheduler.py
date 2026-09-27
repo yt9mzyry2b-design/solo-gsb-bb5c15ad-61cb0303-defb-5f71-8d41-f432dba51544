@@ -219,6 +219,76 @@ def occupancy_by_day(
     return sorted(minutes_by_day.items())
 
 
+@dataclass(frozen=True)
+class StaffingGap:
+    """一段人数不足的区间：UTC 起止、在岗员工 ID（升序）与缺少人数。"""
+
+    start: datetime
+    end: datetime
+    on_duty: tuple[str, ...]
+    missing: int
+
+
+def staffing_gaps(
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    min_staff: int,
+    employee_intervals: dict[str, list[tuple[datetime, datetime]]],
+) -> list[StaffingGap]:
+    """扫描线统计窗口 [window_start, window_end) 内的在岗人数缺口。
+
+    每名员工的半开区间先裁剪到窗口，相交或相接者合并（同一员工只计一人）；
+    同一时刻的上下岗事件一起处理。返回人数不足的非空区间：在岗集合相同的
+    相邻缺员段已合并，结果按起点排序。
+    """
+    events: list[tuple[datetime, bool, str]] = []  # (时刻, 是否下岗, 员工 ID)
+    for emp_id, intervals in employee_intervals.items():
+        clipped = [
+            (max(start, window_start), min(end, window_end))
+            for start, end in intervals
+        ]
+        for start, end in merge_intervals(iv for iv in clipped if iv[0] < iv[1]):
+            events.append((start, False, emp_id))  # 上岗
+            events.append((end, True, emp_id))  # 下岗
+    events.sort()
+
+    gaps: list[StaffingGap] = []
+    on_duty: set[str] = set()
+    prev = window_start
+    i = 0
+    while i < len(events):
+        t = events[i][0]
+        if prev < t and len(on_duty) < min_staff:
+            gaps.append(
+                StaffingGap(prev, t, tuple(sorted(on_duty)), min_staff - len(on_duty))
+            )
+        while i < len(events) and events[i][0] == t:  # 同一时刻的事件一起处理
+            _, is_off, emp_id = events[i]
+            if is_off:
+                on_duty.discard(emp_id)
+            else:
+                on_duty.add(emp_id)
+            i += 1
+        prev = t
+    if prev < window_end and len(on_duty) < min_staff:
+        gaps.append(
+            StaffingGap(
+                prev, window_end, tuple(sorted(on_duty)), min_staff - len(on_duty)
+            )
+        )
+
+    # 在岗集合相同的相邻缺员段合并（分组扫描下的防御性收尾）
+    merged: list[StaffingGap] = []
+    for gap in gaps:
+        last = merged[-1] if merged else None
+        if last and last.end == gap.start and last.on_duty == gap.on_duty:
+            merged[-1] = StaffingGap(last.start, gap.end, last.on_duty, last.missing)
+        else:
+            merged.append(gap)
+    return merged
+
+
 def utc_iso(dt: datetime) -> str:
     """把 UTC 时刻格式化为 Z 结尾的 ISO 8601 字符串。"""
     return dt.isoformat().replace("+00:00", "Z")

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -153,4 +153,71 @@ class DailyOccupancyResponse(BaseModel):
     count: int = Field(..., description="有占用的天数")
     days: list[DayOccupancyOut] = Field(
         ..., description="逐日占用分钟数，按日期升序；无实例时为空列表"
+    )
+
+
+class StaffingEmployee(BaseModel):
+    """一名员工：唯一 ID + 可为空的日程列表（沿用 /overlaps 单侧参数与校验）。"""
+
+    id: str = Field(..., min_length=1, description="员工唯一 ID")
+    schedules: list[OverlapSide] | None = Field(
+        default=None,
+        description="日程列表（与 /overlaps 单侧相同）；null 或空列表表示无排班",
+    )
+
+
+class StaffingGapsRequest(BaseModel):
+    window_start_utc: datetime = Field(
+        ..., description="查询窗口起点（含），UTC，ISO 8601 且以 Z 结尾"
+    )
+    window_end_utc: datetime = Field(
+        ..., description="查询窗口终点（不含），UTC，ISO 8601 且以 Z 结尾"
+    )
+    min_staff: int = Field(..., ge=1, description="最低在岗人数，1～员工总数")
+    employees: list[StaffingEmployee] = Field(
+        ..., min_length=1, max_length=20, description="1～20 名员工，ID 唯一"
+    )
+
+    @field_validator("window_start_utc", "window_end_utc", mode="before")
+    @classmethod
+    def _require_z_suffix(cls, v: object) -> object:
+        """窗口起止必须是以 Z 结尾的 UTC ISO 8601 字符串。"""
+        if isinstance(v, str) and not v.endswith("Z"):
+            raise ValueError("must be an ISO 8601 UTC timestamp ending with 'Z'")
+        return v
+
+    @field_validator("window_start_utc", "window_end_utc")
+    @classmethod
+    def _normalize_utc(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("must be a timezone-aware UTC timestamp ending with 'Z'")
+        return v.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _validate_window_and_staffing(self) -> "StaffingGapsRequest":
+        if not self.window_start_utc < self.window_end_utc:
+            raise ValueError("window_start_utc must be before window_end_utc")
+        if self.window_end_utc - self.window_start_utc > timedelta(
+            days=MAX_RANGE_DAYS
+        ):
+            raise ValueError(f"window must not exceed {MAX_RANGE_DAYS} days")
+        if self.min_staff > len(self.employees):
+            raise ValueError("min_staff must be between 1 and the number of employees")
+        ids = [e.id for e in self.employees]
+        if len(set(ids)) != len(ids):
+            raise ValueError("employee ids must be unique")
+        return self
+
+
+class StaffingGapOut(BaseModel):
+    start_utc: str = Field(..., description="缺员区间起点（含），UTC，Z 结尾")
+    end_utc: str = Field(..., description="缺员区间终点（不含），UTC，Z 结尾")
+    on_duty: list[str] = Field(..., description="区间内在岗员工 ID，升序")
+    missing: int = Field(..., description="缺少人数（min_staff - 在岗人数）")
+
+
+class StaffingGapsResponse(BaseModel):
+    count: int = Field(..., description="缺员区间数")
+    gaps: list[StaffingGapOut] = Field(
+        ..., description="人数不足的非空区间，按起点排序；达标时为空列表"
     )

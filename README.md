@@ -5,7 +5,9 @@
 按指定策略生成**去重且按 UTC 稳定排序**的实例，并返回每个实例的本地时间、UTC 偏移、
 UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各附加时长，
 用**扫描线**检测它们在真实时间轴上的全部冲突；`POST /daily-occupancy`
-则把单侧日程的占用区间合并后按**报告时区的本地日界**切分，逐日统计真实占用分钟数。
+则把单侧日程的占用区间合并后按**报告时区的本地日界**切分，逐日统计真实占用分钟数；
+`POST /staffing-gaps` 在 UTC 窗口内扫描多名员工的上下岗事件，
+输出在岗人数低于最低要求的缺员区间。
 
 ## 快速启动（单条命令）
 
@@ -18,7 +20,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`
 
 ## 配置
 
@@ -197,6 +199,87 @@ docker compose up --build
 | `days[].date` | 报告时区的本地日期（YYYY-MM-DD） |
 | `days[].minutes` | 当日占用的真实分钟数 |
 
+### `POST /staffing-gaps`
+
+在 UTC 窗口内查询在岗人数低于最低要求的缺员区间。每名员工携带**可为空**的
+日程列表（`schedules`，与 `/overlaps` 单侧参数与校验完全一致）；各日程按既有
+跳时 / 叠时策略展开后，实例按真实时长解释为**半开 UTC 区间**
+`[start, start+duration)` 并**裁剪到窗口**。同一员工相交或相接的区间先合并
+（同一员工只计一人），再按时间扫描全部上下岗事件（**同一时刻的事件一起处理**）。
+输出人数不足的非空区间；**在岗集合相同的相邻缺员段合并**，结果按起点排序；
+全程达标时返回空列表。
+
+请求体：
+
+```json
+{
+  "window_start_utc": "2026-03-02T00:00:00Z",
+  "window_end_utc": "2026-03-03T00:00:00Z",
+  "min_staff": 2,
+  "employees": [
+    {
+      "id": "alice",
+      "schedules": [
+        {
+          "timezone": "Europe/Berlin",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "09:00",
+          "duration_minutes": 60
+        }
+      ]
+    },
+    {
+      "id": "bob",
+      "schedules": [
+        {
+          "timezone": "America/New_York",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "03:30",
+          "duration_minutes": 60
+        }
+      ]
+    },
+    {"id": "carol", "schedules": null}
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `window_start_utc` / `window_end_utc` | string | 查询窗口起止（半开），UTC ISO 8601 且**以 `Z` 结尾**；须递增且不超过 366 天 |
+| `min_staff` | int | 最低在岗人数，`1`～员工总数 |
+| `employees` | object[] | `1`～`20` 名员工，`id` 唯一 |
+| `employees[].id` | string | 员工唯一 ID |
+| `employees[].schedules` | object[] \| null | 日程列表（与 `/overlaps` 单侧相同）；`null` 或空列表表示无排班 |
+
+响应 `200`（`gaps` 按 `start_utc` 排序）：
+
+```json
+{
+  "count": 4,
+  "gaps": [
+    {"start_utc": "2026-03-02T00:00:00Z", "end_utc": "2026-03-02T08:00:00Z", "on_duty": [], "missing": 2},
+    {"start_utc": "2026-03-02T08:00:00Z", "end_utc": "2026-03-02T08:30:00Z", "on_duty": ["alice"], "missing": 1},
+    {"start_utc": "2026-03-02T09:00:00Z", "end_utc": "2026-03-02T09:30:00Z", "on_duty": ["bob"], "missing": 1},
+    {"start_utc": "2026-03-02T09:30:00Z", "end_utc": "2026-03-03T00:00:00Z", "on_duty": [], "missing": 2}
+  ]
+}
+```
+
+上例中 alice 在岗 `[08:00, 09:00)` UTC、bob 在岗 `[08:30, 09:30)` UTC、carol 无排班；
+仅 `[08:30, 09:00)` 达到 `min_staff=2`，其余时段按缺员输出。
+
+| 字段 | 说明 |
+| --- | --- |
+| `count` | 缺员区间数 |
+| `gaps[].start_utc` / `gaps[].end_utc` | 缺员区间起止（半开，UTC，Z 结尾） |
+| `gaps[].on_duty` | 区间内在岗员工 ID，升序（可能为空列表） |
+| `gaps[].missing` | 缺少人数（`min_staff` − 在岗人数） |
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -206,6 +289,8 @@ docker compose up --build
 - 区间超过 366 天（`(end_date - start_date).days > 366`，`/overlaps` 对每侧分别限制）
 - `duration_minutes` 不在 1～1440（仅 `/overlaps` 与 `/daily-occupancy`）
 - 星期值越界（不在 0–6）或集合为空等其他字段校验失败
+- `/staffing-gaps`：窗口起止不是以 `Z` 结尾的 UTC 时刻、窗口未递增或超过 366 天、
+  `min_staff` 不在 1～员工总数、员工数不在 1～20、员工 ID 重复
 
 ## 判定原理
 
@@ -227,9 +312,9 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml
