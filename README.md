@@ -5,7 +5,10 @@
 按指定策略生成**去重且按 UTC 稳定排序**的实例，并返回每个实例的本地时间、UTC 偏移、
 UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各附加时长，
 用**扫描线**检测它们在真实时间轴上的全部冲突；`POST /daily-occupancy`
-则把单侧日程的占用区间合并后按**报告时区的本地日界**切分，逐日统计真实占用分钟数。
+则把单侧日程的占用区间合并后按**报告时区的本地日界**切分，逐日统计真实占用分钟数；
+`POST /staffing-gaps` 接收一个 UTC 窗口、最低在岗人数与 1～20 名员工
+（每人携带可空的日程列表），复用既有跳时 / 叠时展开把班次转为真实时长的
+半开区间并裁剪到窗口，按时间扫描上下岗事件，输出人数不足的区间。
 
 ## 快速启动（单条命令）
 
@@ -18,7 +21,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`
 
 ## 配置
 
@@ -197,6 +200,110 @@ docker compose up --build
 | `days[].date` | 报告时区的本地日期（YYYY-MM-DD） |
 | `days[].minutes` | 当日占用的真实分钟数 |
 
+### `POST /staffing-gaps`
+
+查询一个 UTC 窗口内最低在岗人数不足的区间。请求包含窗口起止（均为
+**以 `Z` 结尾的 UTC 时刻**，半开区间 `[window_start, window_end)`）、
+`minimum_staff` 与 1～20 名员工。每名员工有唯一 `id` 和**可为空**的
+`schedules` 日程列表（缺省、`null` 或 `[]` 表示全程不在岗）；列表中每条
+日程的参数与 `/overlaps` 单侧完全一致（全部 `/expand` 展开参数 +
+`duration_minutes`），校验规则也相同。
+
+每条日程按既有 gap / fold 策略展开为实例，再按**真实时长**转成半开 UTC
+区间 `[start, start+duration)`，统一**裁剪到窗口**；同一员工相交或相接的
+区间先合并（重叠班段只计一人）。随后按时间扫描全部上岗 / 下岗事件，
+**同一时刻的事件一起处理**（半开相接不产生瞬时缺口），输出在岗人数低于
+`minimum_staff` 的非空区间；在岗集合相同的相邻缺员段合并，结果按起点排序，
+全程达标时返回空列表。
+
+请求体：
+
+```json
+{
+  "window_start": "2026-03-02T08:00:00Z",
+  "window_end": "2026-03-02T12:00:00Z",
+  "minimum_staff": 2,
+  "employees": [
+    {
+      "id": "alice",
+      "schedules": [
+        {
+          "timezone": "Europe/Berlin",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "09:00",
+          "duration_minutes": 60
+        }
+      ]
+    },
+    {
+      "id": "bob",
+      "schedules": [
+        {
+          "timezone": "America/New_York",
+          "start_date": "2026-03-02",
+          "end_date": "2026-03-02",
+          "weekdays": [0],
+          "local_time": "04:00",
+          "duration_minutes": 120
+        }
+      ]
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `window_start` / `window_end` | string | UTC 窗口起止（起点含、终点不含），ISO 8601 且必须以 `Z` 结尾 |
+| `minimum_staff` | int | 最低在岗人数，`1` 至员工总数 |
+| `employees` | object[] | 员工列表，`1`～`20` 人 |
+| `employees[].id` | string | 员工 ID，非空且在列表内唯一 |
+| `employees[].schedules` | object[]\|null | 日程列表，可缺省 / 为 `null`；每条同 `/overlaps` 单侧参数与校验 |
+
+上例中 alice 为柏林 09:00 CET 起 60 分钟（`[08:00, 09:00)` UTC），
+bob 为纽约 04:00 EST 起 120 分钟（`[09:00, 11:00)` UTC），要求 2 人，
+响应 `200`（`gaps` 按起点升序）：
+
+```json
+{
+  "minimum_staff": 2,
+  "count": 3,
+  "gaps": [
+    {
+      "start_utc": "2026-03-02T08:00:00Z",
+      "end_utc": "2026-03-02T09:00:00Z",
+      "staff_ids": ["alice"],
+      "shortage": 1
+    },
+    {
+      "start_utc": "2026-03-02T09:00:00Z",
+      "end_utc": "2026-03-02T11:00:00Z",
+      "staff_ids": ["bob"],
+      "shortage": 1
+    },
+    {
+      "start_utc": "2026-03-02T11:00:00Z",
+      "end_utc": "2026-03-02T12:00:00Z",
+      "staff_ids": [],
+      "shortage": 2
+    }
+  ]
+}
+```
+
+`09:00` 的下岗（alice）与上岗（bob）同刻处理，因此不会产生零长度缺口；
+相邻两段在岗集合不同（`["alice"]` → `["bob"]`）故不合并。
+
+| 字段 | 说明 |
+| --- | --- |
+| `minimum_staff` | 回显请求的最低在岗人数 |
+| `count` | 缺员区间数 |
+| `gaps[].start_utc` / `end_utc` | 缺员区间起止（半开，UTC，Z 结尾） |
+| `gaps[].staff_ids` | 该区间内在岗的员工 ID，按字典序排序 |
+| `gaps[].shortage` | 缺少人数，等于 `minimum_staff - 实际在岗人数` |
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -204,8 +311,11 @@ docker compose up --build
 - 非法 IANA 时区名（含 `/daily-occupancy` 的 `report_timezone`）
 - `end_date` 早于 `start_date`（逆序区间）
 - 区间超过 366 天（`(end_date - start_date).days > 366`，`/overlaps` 对每侧分别限制）
-- `duration_minutes` 不在 1～1440（仅 `/overlaps` 与 `/daily-occupancy`）
+- `duration_minutes` 不在 1～1440（仅 `/overlaps`、`/daily-occupancy` 与 `/staffing-gaps` 的日程）
 - 星期值越界（不在 0–6）或集合为空等其他字段校验失败
+- `/staffing-gaps` 专属：窗口时刻不是以 `Z` 结尾的合法 UTC 时间；`window_end` 不晚于
+  `window_start`；窗口长度超过 366 天；`minimum_staff` 不在 1～员工总数；
+  员工数不在 1～20；员工 ID 为空或重复；任一员工日程不满足 `/overlaps` 单侧校验
 
 ## 判定原理
 
@@ -227,9 +337,9 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps 与 /health
   models.py      # 请求/响应模型与 422 校验规则
-  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计
+  scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
@@ -13,10 +14,14 @@ from .models import (
     ExpandResponse,
     OverlapRequest,
     OverlapResponse,
+    OverlapSide,
+    StaffingGapsRequest,
+    StaffingGapsResponse,
 )
 from .scheduler import (
     expand_schedule,
     find_overlaps,
+    find_staffing_gaps,
     instance_payload,
     occupancy_by_day,
     utc_iso,
@@ -29,7 +34,8 @@ app = FastAPI(
         "基于标准库 zoneinfo 的民用日程展开 API："
         "通过 UTC 往返校验区分正常 / 跳时 / 叠时，"
         "按策略生成去重且按 UTC 稳定排序的实例，"
-        "并可检测两个日程在真实时间轴上的重叠、按报告时区统计逐日占用。"
+        "并可检测两个日程在真实时间轴上的重叠、按报告时区统计逐日占用、"
+        "扫描 UTC 窗口内的最低在岗人数缺口。"
     ),
 )
 
@@ -122,4 +128,56 @@ def daily_occupancy(req: DailyOccupancyRequest) -> DailyOccupancyResponse:
         report_timezone=req.report_timezone,
         count=len(days),
         days=[{"date": d.isoformat(), "minutes": m} for d, m in days],
+    )
+
+
+def _expand_side(side: OverlapSide) -> list[tuple[datetime, datetime]]:
+    """展开一条 /overlaps 单侧日程为半开 UTC 区间 [utc, utc+duration)。"""
+    tz = ZoneInfo(side.timezone)
+    instances, _ = expand_schedule(
+        tz=tz,
+        start_date=side.start_date,
+        end_date=side.end_date,
+        weekdays=side.weekdays,
+        local_time=side.local_time,
+        gap_strategy=side.gap_strategy.value,
+        fold_strategy=side.fold_strategy.value,
+    )
+    duration = timedelta(minutes=side.duration_minutes)
+    return [(i.utc, i.utc + duration) for i in instances]
+
+
+@app.post(
+    "/staffing-gaps",
+    response_model=StaffingGapsResponse,
+    summary="查询窗口内最低在岗人数缺口",
+)
+def staffing_gaps(req: StaffingGapsRequest) -> StaffingGapsResponse:
+    # 每名员工的各条日程分别按既有跳时 / 叠时策略展开为真实时长的半开区间；
+    # 窗口裁剪与同人区间合并在扫描函数内完成
+    staff_intervals: dict[str, list[tuple[datetime, datetime]]] = {}
+    for employee in req.employees:
+        intervals: list[tuple[datetime, datetime]] = []
+        for side in employee.schedules or []:
+            intervals.extend(_expand_side(side))
+        staff_intervals[employee.id] = intervals
+
+    gaps = find_staffing_gaps(
+        staff_intervals=staff_intervals,
+        window_start=req.window_start,
+        window_end=req.window_end,
+        minimum=req.minimum_staff,
+    )
+    return StaffingGapsResponse(
+        minimum_staff=req.minimum_staff,
+        count=len(gaps),
+        gaps=[
+            {
+                "start_utc": utc_iso(g.start),
+                "end_utc": utc_iso(g.end),
+                "staff_ids": list(g.staff),
+                "shortage": req.minimum_staff - len(g.staff),
+            }
+            for g in gaps
+        ],
     )

@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Iterable, Literal
 from zoneinfo import ZoneInfo
@@ -40,6 +40,15 @@ class Overlap:
     def minutes(self) -> float:
         """重叠时长（分钟）。"""
         return (self.end - self.start).total_seconds() / 60
+
+
+@dataclass(frozen=True)
+class StaffingGap:
+    """一段人数不足区间：UTC 半开区间与当时的在岗员工集合。"""
+
+    start: datetime
+    end: datetime
+    staff: tuple[str, ...]
 
 
 def _valid_interpretations(naive: datetime, tz: ZoneInfo) -> dict[int, datetime]:
@@ -182,6 +191,84 @@ def merge_intervals(
         else:
             merged.append([start, end])
     return [(start, end) for start, end in merged]
+
+
+def clip_intervals(
+    intervals: Iterable[tuple[datetime, datetime]],
+    window_start: datetime,
+    window_end: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """把半开区间裁剪到窗口 [window_start, window_end)，丢弃不相交者。"""
+    clipped: list[tuple[datetime, datetime]] = []
+    for start, end in intervals:
+        s = max(start, window_start)
+        e = min(end, window_end)
+        if s < e:
+            clipped.append((s, e))
+    return clipped
+
+
+def find_staffing_gaps(
+    *,
+    staff_intervals: dict[str, list[tuple[datetime, datetime]]],
+    window_start: datetime,
+    window_end: datetime,
+    minimum: int,
+) -> list[StaffingGap]:
+    """扫描窗口内最低在岗人数不足的区间。
+
+    staff_intervals 为 {员工ID: [半开 UTC 区间 ...]}；每个员工的区间先裁剪到
+    窗口，再合并相交或相接者（同一员工的重叠班段只计一人）。随后按时间扫描
+    全部上岗 / 下岗事件，同一时刻的事件先一并处理，再评估该时刻之后的在岗集合；
+    人数低于 minimum 的非空区间记为缺员段，相邻且在岗集合相同的缺员段合并。
+    返回按起点排序的结果；全程达标时为空列表。
+    """
+    # 裁剪 + 按员工合并；events 为 (时刻, 员工ID, 是否上岗)
+    events: list[tuple[datetime, str, bool]] = []
+    for staff_id, intervals in staff_intervals.items():
+        for start, end in merge_intervals(
+            clip_intervals(intervals, window_start, window_end)
+        ):
+            events.append((start, staff_id, True))
+            events.append((end, staff_id, False))
+    # 事件按时刻分组：同刻事件必须一起处理，避免同刻上下岗之间的瞬时假象
+    events.sort(key=lambda e: e[0])
+
+    active: set[str] = set()
+    gaps: list[StaffingGap] = []
+    cursor = window_start
+
+    def emit(t: datetime) -> None:
+        """记录 [cursor, t) 内的在岗状态，必要时追加或并入缺员段。"""
+        nonlocal cursor
+        if t <= cursor:
+            return
+        staff = tuple(sorted(active))
+        if len(staff) < minimum:
+            if (
+                gaps
+                and gaps[-1].end == cursor
+                and gaps[-1].staff == staff
+            ):
+                # 相邻且在岗集合相同：合并
+                gaps[-1] = replace(gaps[-1], end=t)
+            else:
+                gaps.append(StaffingGap(cursor, t, staff))
+        cursor = t
+
+    i = 0
+    while i < len(events):
+        t = events[i][0]
+        emit(t)  # 处理 [cursor, t)：此刻事件生效前的在岗状态
+        while i < len(events) and events[i][0] == t:  # 同刻事件一并生效
+            _, staff_id, is_start = events[i]
+            if is_start:
+                active.add(staff_id)
+            else:
+                active.discard(staff_id)
+            i += 1
+    emit(window_end)
+    return gaps
 
 
 def occupancy_by_day(

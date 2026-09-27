@@ -5,9 +5,11 @@ from zoneinfo import ZoneInfo
 
 from app.scheduler import (
     Instance,
+    StaffingGap,
     classify,
     expand_schedule,
     find_overlaps,
+    find_staffing_gaps,
     merge_intervals,
     occupancy_by_day,
 )
@@ -321,3 +323,172 @@ def test_occupancy_by_day_fall_back_day_real_minutes():
         instances=instances, duration_minutes=120, report_tz=NY
     )
     assert days == [(date(2026, 11, 1), 120.0)]
+
+
+# --- find_staffing_gaps -----------------------------------------------------
+
+
+def _gap(start: datetime, end: datetime, *staff: str) -> StaffingGap:
+    return StaffingGap(start, end, tuple(sorted(staff)))
+
+
+def test_staffing_gaps_basic():
+    # alice [08,10)，bob [09,11)，窗口 [08,12)，要求 2 人
+    gaps = find_staffing_gaps(
+        staff_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 10))],
+            "bob": [(_utc(1, 9), _utc(1, 11))],
+        },
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        minimum=2,
+    )
+    assert gaps == [
+        _gap(_utc(1, 8), _utc(1, 9), "alice"),
+        _gap(_utc(1, 10), _utc(1, 11), "bob"),
+        _gap(_utc(1, 11), _utc(1, 12)),
+    ]
+
+
+def test_staffing_gaps_covered_returns_empty():
+    # alice 两段相接全程在岗，bob 全程在岗，要求 2 人 -> 无缺口
+    gaps = find_staffing_gaps(
+        staff_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 10)), (_utc(1, 10), _utc(1, 12))],
+            "bob": [(_utc(1, 8), _utc(1, 12))],
+        },
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        minimum=2,
+    )
+    assert gaps == []
+
+
+def test_staffing_gaps_no_intervals_full_gap():
+    gaps = find_staffing_gaps(
+        staff_intervals={"alice": [], "bob": []},
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 9),
+        minimum=1,
+    )
+    assert gaps == [_gap(_utc(1, 8), _utc(1, 9))]
+
+
+def test_staffing_gaps_same_employee_overlaps_count_once():
+    # 同一员工两段重叠区间，合并后在全程仍只计 1 人
+    gaps = find_staffing_gaps(
+        staff_intervals={
+            "alice": [
+                (_utc(1, 8), _utc(1, 10)),
+                (_utc(1, 9), _utc(1, 11)),
+            ],
+        },
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        minimum=2,
+    )
+    assert gaps == [
+        _gap(_utc(1, 8), _utc(1, 11), "alice"),
+        _gap(_utc(1, 11), _utc(1, 12)),
+    ]
+
+
+def test_staffing_gaps_touching_intervals_merge():
+    # [08,09) 与 [09,10) 相接，合并为连续在岗
+    gaps = find_staffing_gaps(
+        staff_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9)), (_utc(1, 9), _utc(1, 10))]
+        },
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        minimum=1,
+    )
+    assert gaps == []
+
+
+def test_staffing_gaps_clip_to_window():
+    # 区间跨出窗口两侧，裁剪后窗口内全程 1 人
+    gaps = find_staffing_gaps(
+        staff_intervals={"alice": [(_utc(1, 7), _utc(1, 13))]},
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        minimum=1,
+    )
+    assert gaps == []
+
+    # 仅头部相交 [10,14) 裁剪为 [10,12) -> 仅开头缺口
+    gaps = find_staffing_gaps(
+        staff_intervals={"alice": [(_utc(1, 10), _utc(1, 14))]},
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        minimum=1,
+    )
+    assert gaps == [_gap(_utc(1, 8), _utc(1, 10))]
+
+
+def test_staffing_gaps_staff_ids_sorted():
+    gaps = find_staffing_gaps(
+        staff_intervals={
+            "zoe": [(_utc(1, 8), _utc(1, 12))],
+            "amy": [(_utc(1, 8), _utc(1, 9))],
+        },
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        minimum=3,
+    )
+    assert gaps[0].staff == ("amy", "zoe")
+
+
+def test_staffing_gaps_simultaneous_events_at_boundary():
+    # alice [08,09)、bob [09,10)：09:00 上下岗同时处理，半开相接不产生缺口
+    gaps = find_staffing_gaps(
+        staff_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9))],
+            "bob": [(_utc(1, 9), _utc(1, 10))],
+        },
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        minimum=1,
+    )
+    assert gaps == []
+
+    # 窗口起点同刻上岗：先评估空集合（零长度），再生效 -> 起点无缺口
+    gaps = find_staffing_gaps(
+        staff_intervals={"alice": [(_utc(1, 8), _utc(1, 10))]},
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        minimum=1,
+    )
+    assert gaps == []
+
+
+def test_staffing_gaps_same_staff_adjacent_segments_merge():
+    # [08,09) 与 [09,10) 相接，同人区间先合并，要求 2 人 -> 单段缺口
+    gaps = find_staffing_gaps(
+        staff_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9)), (_utc(1, 9), _utc(1, 10))],
+        },
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 10),
+        minimum=2,
+    )
+    assert gaps == [_gap(_utc(1, 8), _utc(1, 10), "alice")]
+
+
+def test_staffing_gaps_different_staff_not_merged():
+    # 相邻缺员段在岗集合不同：保持独立两段
+    gaps = find_staffing_gaps(
+        staff_intervals={
+            "alice": [(_utc(1, 8), _utc(1, 9))],
+            "bob": [(_utc(1, 10), _utc(1, 11))],
+        },
+        window_start=_utc(1, 8),
+        window_end=_utc(1, 12),
+        minimum=2,
+    )
+    assert gaps == [
+        _gap(_utc(1, 8), _utc(1, 9), "alice"),
+        _gap(_utc(1, 9), _utc(1, 10)),
+        _gap(_utc(1, 10), _utc(1, 11), "bob"),
+        _gap(_utc(1, 11), _utc(1, 12)),
+    ]

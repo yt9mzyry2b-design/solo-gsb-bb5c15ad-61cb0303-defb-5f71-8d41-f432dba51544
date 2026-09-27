@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,6 +14,23 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MAX_RANGE_DAYS = 366
+MAX_STAFF = 20
+
+
+def _parse_z_utc(v: str) -> datetime:
+    """解析以 Z 结尾的 UTC 时刻，其他形式（含显式偏移）一律拒绝。
+
+    由 FastAPI/Pydantic 捕获 ValueError 后转为 422。
+    """
+    if not isinstance(v, str) or not v.endswith("Z"):
+        raise ValueError("timestamp must be a UTC string ending with 'Z'")
+    try:
+        dt = datetime.fromisoformat(v[:-1])
+    except ValueError:
+        raise ValueError(f"invalid UTC timestamp: {v!r}") from None
+    if dt.tzinfo is not None:
+        raise ValueError(f"invalid UTC timestamp: {v!r}")
+    return dt.replace(tzinfo=timezone.utc)
 
 
 def _check_iana_timezone(v: str) -> str:
@@ -153,4 +170,78 @@ class DailyOccupancyResponse(BaseModel):
     count: int = Field(..., description="有占用的天数")
     days: list[DayOccupancyOut] = Field(
         ..., description="逐日占用分钟数，按日期升序；无实例时为空列表"
+    )
+
+
+# --- POST /staffing-gaps ----------------------------------------------------
+
+
+class StaffingEmployee(BaseModel):
+    """一名员工：唯一 ID + 可空的日程列表（日程参数同 /overlaps 单侧）。"""
+
+    id: str = Field(..., min_length=1, description="员工 ID，请求内唯一")
+    schedules: list[OverlapSide] | None = Field(
+        default=None,
+        description=(
+            "日程列表，可为空 / 缺省（表示该员工全程不在岗）；"
+            "每条日程的参数与 /overlaps 单侧一致，校验规则相同"
+        ),
+    )
+
+
+class StaffingGapsRequest(BaseModel):
+    """最低在岗人数缺口查询请求。"""
+
+    window_start: datetime = Field(
+        ..., description="窗口起点（含），UTC，ISO 8601 且以 Z 结尾"
+    )
+    window_end: datetime = Field(
+        ..., description="窗口终点（不含），UTC，ISO 8601 且以 Z 结尾"
+    )
+    minimum_staff: int = Field(
+        ..., ge=1, description="最低在岗人数，1 至员工总数"
+    )
+    employees: list[StaffingEmployee] = Field(
+        ..., min_length=1, max_length=MAX_STAFF, description="员工列表，1～20 人"
+    )
+
+    @field_validator("window_start", "window_end", mode="before")
+    @classmethod
+    def _validate_utc_z(cls, v: object) -> object:
+        if isinstance(v, str):
+            return _parse_z_utc(v)
+        return v
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "StaffingGapsRequest":
+        if self.window_end <= self.window_start:
+            raise ValueError("window_end must be after window_start")
+        if (self.window_end - self.window_start) > timedelta(days=MAX_RANGE_DAYS):
+            raise ValueError(
+                f"window must not exceed {MAX_RANGE_DAYS} days"
+            )
+        ids = [e.id for e in self.employees]
+        if len(set(ids)) != len(ids):
+            raise ValueError("employee ids must be unique")
+        if self.minimum_staff > len(self.employees):
+            raise ValueError(
+                "minimum_staff must be between 1 and the number of employees"
+            )
+        return self
+
+
+class StaffingGapOut(BaseModel):
+    start_utc: str = Field(..., description="缺员区间起点（含），UTC")
+    end_utc: str = Field(..., description="缺员区间终点（不含），UTC")
+    staff_ids: list[str] = Field(
+        ..., description="该区间内在岗的员工 ID，按字典序排序"
+    )
+    shortage: int = Field(..., description="缺少人数 = minimum_staff - 实际在岗人数")
+
+
+class StaffingGapsResponse(BaseModel):
+    minimum_staff: int = Field(..., description="请求的最低在岗人数")
+    count: int = Field(..., description="缺员区间数")
+    gaps: list[StaffingGapOut] = Field(
+        ..., description="缺员区间，按起点升序；全程达标时为空列表"
     )
